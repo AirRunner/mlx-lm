@@ -32,6 +32,8 @@ def mixed_quant_predicate_builder(
         low_bits = 3
     elif recipe == "mixed_4_6":
         low_bits = 4
+    elif recipe == "moe_3_8":
+        low_bits = 3
     else:
         raise ValueError(f"Invalid quant recipe {recipe}")
 
@@ -63,6 +65,31 @@ def mixed_quant_predicate_builder(
             or index >= 7 * num_layers // 8
             or (index - num_layers // 8) % 3 == 2
         )
+
+        if recipe == "moe_3_8":
+            # MoE router, shared expert gate, GDN/SSM: full precision.
+            # These are either tiny (router) or recurrent/always-active and
+            # highly sensitive to quantization error.
+            if path.endswith(".gate") or path.endswith(".shared_expert_gate"):
+                return False
+            # GDN/SSM linear projections: 8-bit (weight matrices within linear_attn).
+            # Non-linear SSM states (conv1d, norms, ssm_a) are not nn.Linear so
+            # the predicate is never called for them -- they stay in BF16 naturally.
+            if "linear_attn" in path:
+                return {"group_size": group_size, "bits": 8, "mode": mode}
+            # Attention, shared expert, SSM projections, lm_head, embeddings: 8-bit.
+            if (
+                "mlp.shared_expert." in path
+                or "self_attn" in path
+                or "lm_head" in path
+                or "embed_tokens" in path
+            ):
+                return {"group_size": group_size, "bits": 8, "mode": mode}
+            # Routed experts (switch_mlp): down_proj at 4-bit, gate/up at 3-bit.
+            if "switch_mlp" in path and "down_proj" in path:
+                return {"group_size": group_size, "bits": 4, "mode": mode}
+            return {"group_size": group_size, "bits": low_bits, "mode": mode}
+
         if (
             "v_proj" in path or "v_a_proj" in path or "v_b_proj" in path
         ) and use_more_bits:
@@ -77,7 +104,7 @@ def mixed_quant_predicate_builder(
     return mixed_quant_predicate
 
 
-QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"]
+QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6", "moe_3_8"]
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
