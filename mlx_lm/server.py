@@ -1927,6 +1927,24 @@ def main():
         help="Step size for prefill processing (default: 2048)",
     )
     parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Number of bits for KV cache quantization. None means no quantization.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=0,
+        help="Step to begin quantizing the KV cache (default: 0)",
+    )
+    parser.add_argument(
         "--prompt-cache-size",
         type=int,
         default=10,

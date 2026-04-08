@@ -23,6 +23,8 @@ from .generate_utils import BatchCounters, BatchCountersSnapshot, BatchStats
 from .models.cache import (
     MTPPromptCacheState,
     QuantizedKVCache,
+    QuantizedRotatingKVCache,
+    RotatingKVCache,
     TokenBuffer,
     can_trim_prompt_cache,
     load_prompt_cache,
