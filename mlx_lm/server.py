@@ -624,7 +624,14 @@ class ResponseGenerator:
         return stop_matcher, text_sm
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        if getattr(self.cli_args, "kv_bits", None) is not None:
+            return False
+        if not self.model_provider.is_batchable:
+            return False
+        if args.seed is not None:
+            return False
+
+        return True
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -947,6 +954,11 @@ class ResponseGenerator:
 
             # Process the prompt and generate tokens
             stop_state = stop_matcher.make_state()
+            kv_kwargs = {}
+            if getattr(self.cli_args, "kv_bits", None) is not None:
+                kv_kwargs["kv_bits"] = self.cli_args.kv_bits
+                kv_kwargs["kv_group_size"] = self.cli_args.kv_group_size
+                kv_kwargs["quantized_kv_start"] = self.cli_args.quantized_kv_start
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -967,6 +979,7 @@ class ResponseGenerator:
                 xtc_probability=args.sampling.xtc_probability,
                 xtc_threshold=args.sampling.xtc_threshold,
                 xtc_special_tokens=_xtc_special_tokens(tokenizer),
+                **kv_kwargs,
             ):
                 finish_reason = gen.finish_reason
 
@@ -1872,6 +1885,24 @@ def main():
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Number of bits for KV cache quantization. None means no quantization.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=0,
+        help="Step to begin quantizing the KV cache (default: 0)",
     )
     parser.add_argument(
         "--prompt-cache-size",
