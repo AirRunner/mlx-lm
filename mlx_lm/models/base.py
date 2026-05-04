@@ -84,6 +84,32 @@ def quantized_scaled_dot_product_attention(
 
     queries *= scale
 
+    if n_repeats > 1 and L > 1:
+        # mx.quantized_matmul dispatches to different Metal kernels (qmv/qmm_splitk/qmm)
+        # based on M. For L < ~32 (e.g. MTP 2-token verification), qmv produces wrong
+        # results with GQA broadcasting and N > ~2048 cached tokens. Dequantize K/V and
+        # use float matmul as a workaround.
+        # TODO: remove once ml-explore/mlx#3480 is fixed and MLX updated in LM Studio.
+        keys_dq = mx.dequantize(*q_keys, group_size=group_size, bits=bits)
+        values_dq = mx.dequantize(
+            *q_values, group_size=value_group_size, bits=value_bits
+        )
+        scores = queries.reshape(B, n_kv_heads, n_repeats, L, D) @ keys_dq[
+            :, :, None, :, :
+        ].transpose(0, 1, 2, 4, 3)
+        if mask is not None:
+            if isinstance(mask, str):
+                qL, kL = scores.shape[-2:]
+                q_indices = mx.arange(kL - qL, kL)
+                k_indices = mx.arange(kL)
+                mask = q_indices[:, None] >= k_indices[None]
+            if mask.dtype == mx.bool_:
+                scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+            else:
+                scores += mask
+        scores = mx.softmax(scores, axis=-1, precise=True)
+        return (scores @ values_dq[:, :, None, :, :]).reshape(B, n_q_heads, L, D)
+
     if n_repeats > 1:
         queries = mx.reshape(queries, (B, n_kv_heads, n_repeats, L, D))
         q_keys = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_keys)
