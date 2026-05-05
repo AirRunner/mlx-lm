@@ -286,6 +286,62 @@ class TestMTP(unittest.TestCase):
         """
         self._assert_residual_varies(self._collect_rejection_tokens(temp=1.0))
 
+    def test_mtp_depth2_identity(self):
+        """mtp_generate_step with mtp_depth=2 must produce the same greedy tokens
+        as generate_step.
+
+        At depth=2 the verify backbone runs on [y, draft_0, draft_1] with
+        n_confirmed=2, so two GDN snapshots are taken.  Any bug in the
+        multi-snapshot rollback or the chained MTP hidden-state threading
+        would cause a divergence from serial greedy generation.
+        """
+        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
+        n_tokens = 12
+
+        std_cache = make_prompt_cache(self.model)
+        std_tokens = []
+        for i, (tok, _) in enumerate(
+            generate_step(prompt, self.model, prompt_cache=std_cache)
+        ):
+            std_tokens.append(int(tok))
+            if i + 1 >= n_tokens:
+                break
+
+        mtp_tokens = []
+        for tok, _, _ in mtp_generate_step(
+            prompt, self.model, max_tokens=n_tokens, mtp_depth=2
+        ):
+            mtp_tokens.append(int(tok))
+            if len(mtp_tokens) >= n_tokens:
+                break
+
+        self.assertEqual(
+            std_tokens,
+            mtp_tokens,
+            f"Token mismatch at depth=2: std={std_tokens}, mtp={mtp_tokens}",
+        )
+
+    def test_mtp_depth2_probabilistic_completes(self):
+        """mtp_generate_step with mtp_depth=2 should complete without errors
+        with a stochastic sampler, exercising the residual-sampling rejection
+        path at both draft positions.
+        """
+        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
+        n_tokens = 12
+
+        def stochastic(logprobs):
+            return mx.random.categorical(logprobs)
+
+        tokens = []
+        for tok, _, _ in mtp_generate_step(
+            prompt, self.model, sampler=stochastic, max_tokens=n_tokens, mtp_depth=2
+        ):
+            tokens.append(int(tok))
+            if len(tokens) >= n_tokens:
+                break
+
+        self.assertEqual(len(tokens), n_tokens)
+
 
 if __name__ == "__main__":
     unittest.main()

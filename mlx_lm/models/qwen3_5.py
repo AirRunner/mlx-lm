@@ -209,29 +209,35 @@ class GatedDeltaNet(nn.Module):
             qkv = mx.where(mask[..., None], qkv, 0)
 
         if n_confirmed > 0 and n_confirmed < S:
-            # Process confirmed and draft tokens separately so we can snapshot the
-            # SSM/conv state between them for exact rollback on draft rejection.
-            mask_c = mask[:, :n_confirmed] if mask is not None else None
-            mask_d = mask[:, n_confirmed:] if mask is not None else None
-            out_c, conv_c, ssm_c = self._process_chunk(
-                qkv[:, :n_confirmed],
-                a[:, :n_confirmed],
-                b[:, :n_confirmed],
-                conv_state,
-                ssm_state,
-                mask_c,
-            )
+            # Snapshot the SSM/conv state at each confirmed position so that
+            # mtp_generate_step can roll back to any position on draft rejection.
+            outs = []
+            conv_cur, ssm_cur = conv_state, ssm_state
             if cache is not None:
-                cache.rollback_state = (conv_c, ssm_c)
+                cache.rollback_states = []
+            for i in range(n_confirmed):
+                mask_i = mask[:, i : i + 1] if mask is not None else None
+                out_i, conv_cur, ssm_cur = self._process_chunk(
+                    qkv[:, i : i + 1],
+                    a[:, i : i + 1],
+                    b[:, i : i + 1],
+                    conv_cur,
+                    ssm_cur,
+                    mask_i,
+                )
+                outs.append(out_i)
+                if cache is not None:
+                    cache.rollback_states.append((conv_cur, ssm_cur))
+            mask_d = mask[:, n_confirmed:] if mask is not None else None
             out_d, conv_f, ssm_f = self._process_chunk(
                 qkv[:, n_confirmed:],
                 a[:, n_confirmed:],
                 b[:, n_confirmed:],
-                conv_c,
-                ssm_c,
+                conv_cur,
+                ssm_cur,
                 mask_d,
             )
-            out = mx.concatenate([out_c, out_d], axis=1)
+            out = mx.concatenate([*outs, out_d], axis=1)
         else:
             lengths = cache.lengths if cache is not None else None
             out, conv_f, ssm_f = self._process_chunk(
@@ -426,16 +432,19 @@ class TextModel(nn.Module):
         hidden_states: mx.array,
         next_token_ids: mx.array,
         mtp_cache: Any,
-    ) -> mx.array:
+        *,
+        return_hidden: bool = False,
+    ):
         """Run the MTP head and apply the shared lm_head.
 
         Args:
             hidden_states: Backbone pre-norm hidden state (B, N, H). N=1 during decode, N>1 during prompt prefill.
             next_token_ids: Next token ids, shape (B, N).
             mtp_cache: KVCache entries for the MTP transformer layers.
+            return_hidden: If True, return (logits, mtp_hidden) instead of logits.
 
         Returns:
-            logits of shape (B, N, vocab_size).
+            logits of shape (B, 1, vocab_size), or (logits, hidden) if return_hidden.
         """
         mtp_out = self.mtp(
             hidden_states,
@@ -444,8 +453,10 @@ class TextModel(nn.Module):
             mtp_cache,
         )
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(mtp_out)
-        return self.lm_head(mtp_out)
+            logits = self.model.embed_tokens.as_linear(mtp_out)
+        else:
+            logits = self.lm_head(mtp_out)
+        return (logits, mtp_out) if return_hidden else logits
 
     @property
     def layers(self):
@@ -694,9 +705,13 @@ class Model(nn.Module):
         hidden_states: mx.array,
         next_token_ids: mx.array,
         mtp_cache: Any,
-    ) -> mx.array:
+        *,
+        return_hidden: bool = False,
+    ):
         """Delegate to language_model.mtp_forward. See TextModel.mtp_forward."""
-        return self.language_model.mtp_forward(hidden_states, next_token_ids, mtp_cache)
+        return self.language_model.mtp_forward(
+            hidden_states, next_token_ids, mtp_cache, return_hidden=return_hidden
+        )
 
     def make_mtp_cache(self):
         """Return fresh KVCache entries for the MTP layer(s)."""

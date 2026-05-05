@@ -1001,6 +1001,7 @@ class ResponseGenerator:
                 xtc_probability=args.sampling.xtc_probability,
                 xtc_threshold=args.sampling.xtc_threshold,
                 xtc_special_tokens=_xtc_special_tokens(tokenizer),
+                mtp_depth=getattr(self.cli_args, "mtp_depth", 1),
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -1905,6 +1906,13 @@ def main():
         action="store_true",
         help="Use native Multi-Token Prediction for speculative decoding "
         "(requires a model with an MTP head, e.g. Qwen3.5).",
+    )
+    parser.add_argument(
+        "--mtp-depth",
+        type=int,
+        default=1,
+        help="Number of MTP draft tokens to propose per round (default: 1). "
+        "Requires --mtp.",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
