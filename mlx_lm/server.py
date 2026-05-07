@@ -782,6 +782,17 @@ class ResponseGenerator:
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
                         state_machines=[sm],
+                        mtp_sampler_params=[
+                            {
+                                "temp": args.sampling.temperature,
+                                "top_p": args.sampling.top_p,
+                                "top_k": args.sampling.top_k,
+                                "min_p": args.sampling.min_p,
+                                "xtc_probability": args.sampling.xtc_probability,
+                                "xtc_threshold": args.sampling.xtc_threshold,
+                                "xtc_special_tokens": _xtc_special_tokens(tokenizer),
+                            }
+                        ],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -832,6 +843,7 @@ class ResponseGenerator:
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
                         stream=generation_stream,
+                        mtp=mtp_active,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue

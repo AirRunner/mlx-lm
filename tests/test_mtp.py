@@ -3,7 +3,7 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.generate import generate_step, mtp_generate_step
+from mlx_lm.generate import GenerationBatch, generate_step, mtp_generate_step
 from mlx_lm.models.cache import make_prompt_cache
 
 
@@ -285,6 +285,168 @@ class TestMTP(unittest.TestCase):
         conflating rejection tokens with bonus tokens (also from_draft=False).
         """
         self._assert_residual_varies(self._collect_rejection_tokens(temp=1.0))
+
+
+class TestMTPBatch(unittest.TestCase):
+    """Tests for MTP speculative decoding in GenerationBatch (B > 1)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _make_qwen3_5_mtp_model()
+
+    def _make_generation_batch(self, prompts, mtp=True, sampler=None):
+        """Build a GenerationBatch from a list of token sequences.
+
+        Processes each prompt independently (B=1 prefill each), then merges
+        the caches and constructs a batched GenerationBatch.
+
+        sampler: per-sequence sampler callable, or None for greedy (argmax).
+        """
+        from mlx_lm.generate import SequenceStateMachine
+        from mlx_lm.models.cache import make_prompt_cache
+
+        B = len(prompts)
+        per_seq_caches = []
+        for prompt in prompts:
+            cache = make_prompt_cache(self.model)
+            if len(prompt) > 1:
+                self.model(mx.array([prompt[:-1]]), cache=cache)
+                mx.eval([c.state for c in cache if hasattr(c, "state")])
+            per_seq_caches.append(cache)
+
+        # Merge all per-sequence caches into a batch cache.
+        n_layers = len(per_seq_caches[0])
+        merged_cache = []
+        for layer_idx in range(n_layers):
+            layer_caches = [per_seq_caches[i][layer_idx] for i in range(B)]
+            merged_cache.append(type(layer_caches[0]).merge(layer_caches))
+        mx.eval([c.state for c in merged_cache if hasattr(c, "state")])
+
+        fallback = (
+            sampler if sampler is not None else (lambda lp: mx.argmax(lp, axis=-1))
+        )
+        samplers = [sampler] * B  # None → greedy path (_mtp_is_greedy=True)
+        last_tokens = mx.array([p[-1] for p in prompts], dtype=mx.uint32)
+        sm = SequenceStateMachine({}, initial="normal")
+        return GenerationBatch(
+            model=self.model,
+            uids=list(range(B)),
+            inputs=last_tokens,
+            prompt_cache=merged_cache,
+            tokens=[list(p[:-1]) for p in prompts],
+            samplers=samplers,
+            fallback_sampler=fallback,
+            logits_processors=[[]] * B,
+            state_machines=[sm] * B,
+            max_tokens=[64] * B,
+            mtp=mtp,
+        )
+
+    def test_mtp_batch_matches_b1(self):
+        """B=2 MTP batch must emit identical tokens to two independent B=1 runs."""
+        prompts = [[1, 2, 3, 4], [5, 6, 7, 8]]
+        N_STEPS = 6  # backbone forward passes (alternates step-A and step-B)
+
+        # Collect tokens from the B=2 batch
+        batch = self._make_generation_batch(prompts, mtp=True)
+        batch_tokens = {i: [] for i in range(len(prompts))}
+        for _ in range(N_STEPS):
+            for r in batch.next():
+                batch_tokens[r.uid].append(r.token)
+            if not batch.uids:
+                break
+
+        # Compare against independent B=1 mtp_generate_step runs
+        for i, prompt in enumerate(prompts):
+            n = len(batch_tokens[i])
+            b1 = []
+            for tok, _, _ in mtp_generate_step(
+                mx.array(prompt, dtype=mx.uint32), self.model, max_tokens=n + 4
+            ):
+                b1.append(tok)
+                if len(b1) >= n:
+                    break
+            self.assertEqual(
+                batch_tokens[i],
+                b1,
+                f"seq {i}: batch={batch_tokens[i]} b1={b1}",
+            )
+
+    def test_mtp_batch_stochastic_reproducible(self):
+        """B=2 stochastic MTP with mx.random.seed is reproducible and stays alive."""
+        stochastic = lambda lp: mx.random.categorical(lp[None])[0]
+        prompts = [[1, 2, 3, 4], [5, 6, 7, 8]]
+
+        def collect(seed):
+            mx.random.seed(seed)
+            batch = self._make_generation_batch(prompts, mtp=True, sampler=stochastic)
+            self.assertFalse(batch._mtp_is_greedy)
+            toks = {i: [] for i in range(len(prompts))}
+            for _ in range(6):
+                for r in batch.next():
+                    toks[r.uid].append(r.token)
+                if not batch.uids:
+                    break
+            return toks
+
+        run1 = collect(seed=7)
+        run2 = collect(seed=7)
+        self.assertEqual(run1, run2)
+
+        # Different seed must produce different tokens (sanity check model isn't degenerate)
+        run3 = collect(seed=99)
+        different = any(run1[i] != run3[i] for i in range(len(prompts)))
+        self.assertTrue(different, "different seeds produced identical tokens")
+
+    def test_mtp_batch_rollback_selective(self):
+        """rollback_selective on ArraysCache should leave accepted sequences unchanged."""
+        from mlx_lm.models.cache import ArraysCache
+
+        B = 4
+        # Create a fake ArraysCache with known state
+        c = ArraysCache(size=2)
+        c.cache[0] = mx.ones((B, 3, 8))  # conv_state
+        c.cache[1] = mx.ones((B, 2, 16))  # ssm_state
+        # Snapshot "before draft" state = zeros
+        c.rollback_state = (mx.zeros((B, 3, 8)), mx.zeros((B, 2, 16)))
+
+        # Accept sequences 0, 2; reject sequences 1, 3
+        accept_mask = mx.array([True, False, True, False])
+        c.rollback_selective(accept_mask)
+
+        # Accepted (0, 2): keep ones; rejected (1, 3): restore zeros
+        conv = c.cache[0]
+        self.assertTrue(mx.all(conv[0] == 1.0).item())
+        self.assertTrue(mx.all(conv[1] == 0.0).item())
+        self.assertTrue(mx.all(conv[2] == 1.0).item())
+        self.assertTrue(mx.all(conv[3] == 0.0).item())
+        self.assertIsNone(c.rollback_state)
+
+    def test_mtp_batch_trim_selective(self):
+        """trim_selective on BatchKVCache should only decrement rejected sequences."""
+        from mlx_lm.models.cache import BatchKVCache
+
+        c = BatchKVCache(left_padding=[0, 0, 0])
+        c.offset = mx.array([10, 10, 10])
+
+        accept_mask = mx.array([True, False, True])
+        c.trim_selective(accept_mask)
+        offsets = c.offset.tolist()
+        self.assertEqual(offsets[0], 10)  # accepted: unchanged
+        self.assertEqual(offsets[1], 9)  # rejected: decremented
+        self.assertEqual(offsets[2], 10)  # accepted: unchanged
+
+    def test_kvcache_filter(self):
+        """KVCache.filter should select batch indices along dim 0."""
+        from mlx_lm.models.cache import KVCache
+
+        c = KVCache()
+        c.keys = mx.arange(12, dtype=mx.float32).reshape(3, 1, 4, 1)
+        c.values = mx.ones((3, 1, 4, 1))
+        c.offset = 4
+        c.filter([0, 2])
+        self.assertEqual(c.keys.shape[0], 2)
+        self.assertEqual(c.values.shape[0], 2)
 
 
 if __name__ == "__main__":

@@ -662,6 +662,67 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def _mtp_accept(
+    log_accepts: mx.array,
+    is_greedy: bool,
+    verify_preds: mx.array,
+    draft_toks: mx.array,
+) -> List[bool]:
+    """Accept/reject B draft tokens via exact-match (greedy) or Metropolis-Hastings."""
+    if is_greedy:
+        mx.eval(verify_preds, draft_toks)
+        return [v == d for v, d in zip(verify_preds.tolist(), draft_toks.tolist())]
+    u = mx.random.uniform(shape=log_accepts.shape)
+    mx.eval(u, log_accepts)
+    return [
+        la >= 0 or u_i < math.exp(la)
+        for la, u_i in zip(log_accepts.tolist(), u.tolist())
+    ]
+
+
+def _mtp_residual_sample(verify_lps: mx.array, draft_lps: mx.array) -> mx.array:
+    """Sample corrected tokens from max(p_target - p_draft, 0) / Z on rejection.
+
+    Z = 0 is a fp artifact (theoretically unreachable); falls back to p_target.
+    verify_lps, draft_lps: (B, vocab). Returns: (B,).
+    """
+    p_target = mx.exp(verify_lps)
+    p_draft = mx.exp(draft_lps)
+    residual = mx.maximum(p_target - p_draft, 0.0)
+    z = residual.sum(axis=-1, keepdims=True)  # (B, 1)
+    dist = mx.where(z > 0, residual, p_target)
+    # categorical treats -inf log-prob as p=0.
+    return mx.random.categorical(mx.log(dist))
+
+
+def _apply_filter_and_sample(
+    lp: mx.array,
+    chain: List[Callable],
+    xtc_cell: Optional[List],
+    temp: float,
+    xtc_draw=None,
+) -> Tuple[mx.array, mx.array]:
+    """Apply a filter chain and sample one token from log-probs `lp` (1-D, vocab).
+
+    Returns (token, accept_lp) where accept_lp is the temp+filter-adjusted
+    log-prob distribution used for the MTP acceptance criterion.
+    """
+    if temp == 0.0:
+        return mx.argmax(lp, axis=-1), lp
+    if chain:
+        if xtc_cell is not None:
+            xtc_cell[0] = xtc_draw
+        masked = lp
+        for f in chain:
+            masked = f(masked)
+        tok = categorical_sampling(masked, temp)
+        scaled = masked / temp
+        return tok, scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+    tok = categorical_sampling(lp, temp)
+    scaled = lp / temp
+    return tok, scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+
+
 def mtp_generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -740,23 +801,9 @@ def mtp_generate_step(
                 logits = processor(tokens, logits)
             logits = logits.squeeze(0)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        if _filter_chain:
-            if _xtc_cell is not None:
-                _xtc_cell[0] = xtc_draw  # None = fresh draw; mx.array = shared draw
-            masked = logprobs
-            for f in _filter_chain:
-                masked = f(masked)
-            token = categorical_sampling(masked, temp)
-            # lp_accept must reflect the same filtered distribution as token.
-            scaled = masked / temp
-            lp_accept = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
-        elif _is_greedy:
-            token = mx.argmax(logprobs, axis=-1)
-            lp_accept = logprobs
-        else:
-            token = categorical_sampling(logprobs, temp)
-            scaled = logprobs / temp
-            lp_accept = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+        token, lp_accept = _apply_filter_and_sample(
+            logprobs, _filter_chain, _xtc_cell, temp, xtc_draw
+        )
         return token, logprobs, lp_accept
 
     def _clear_rollback():
@@ -906,22 +953,20 @@ def mtp_generate_step(
                 n_confirmed=1,
                 xtc_draw=draft_xtc_draw,
             )
-            u = mx.random.uniform()
-            mx.eval(toks, draft_tok, u)
+            mx.eval(toks, draft_tok)
 
             verify_pred, bonus_tok = toks[0], toks[1]
             verify_lp, bonus_lp = lps[0], lps[1]
             verify_accept_lp = accept_lps[0]
             draft_tok_id = draft_tok.item()
 
-            if _is_greedy:
-                accept = verify_pred.item() == draft_tok_id
-            else:
-                # Probabilistic acceptance: min(1, p_target/p_draft) with temp-adjusted logprobs.
-                log_accept = (
-                    verify_accept_lp[draft_tok_id] - draft_accept_lp[draft_tok_id]
-                ).item()
-                accept = log_accept >= 0 or u.item() < math.exp(log_accept)
+            log_accept = verify_accept_lp[draft_tok_id] - draft_accept_lp[draft_tok_id]
+            (accept,) = _mtp_accept(
+                log_accept.reshape(1),
+                _is_greedy,
+                verify_pred.reshape(1),
+                draft_tok.reshape(1),
+            )
 
             hidden_at_confirmed = hidden[:, 0:1, :]
             hidden_at_draft = hidden[:, 1:2, :]
@@ -950,20 +995,11 @@ def mtp_generate_step(
                 _rollback_draft()
                 if logits_processors and prev_tokens is not None:
                     prev_tokens = prev_tokens[:-1]  # discard rejected draft token
-                verify_tok_id = verify_pred.item()
-                if not _is_greedy:
-                    # Sample from residual distribution max(p_target - p_draft, 0) / Z
-                    # (Leviathan et al. 2022 §2.3; Chen et al. 2023). Guarantees the
-                    # output marginal equals the target distribution exactly.
-                    # Both distributions are temperature-adjusted to match sampling.
-                    p_target = mx.exp(verify_accept_lp)
-                    p_draft = mx.exp(draft_accept_lp)
-                    residual = mx.maximum(p_target - p_draft, 0.0)
-                    z = residual.sum(keepdims=True)
-                    dist = mx.where(z > 0, residual, p_target)
-                    # categorical treats -inf log-prob as p=0.
-                    verify_tok_id = mx.random.categorical(
-                        mx.log(dist).reshape(1, -1)
+                if _is_greedy:
+                    verify_tok_id = verify_pred.item()
+                else:
+                    verify_tok_id = _mtp_residual_sample(
+                        verify_accept_lp[None], draft_accept_lp[None]
                     ).item()
                 ntoks += 1
                 yield verify_tok_id, verify_lp, False
@@ -1394,6 +1430,7 @@ class PromptProcessingBatch:
         ] = None,
         state_machines: Optional[List[SequenceStateMachine]] = None,
         max_tokens: Optional[List[int]] = None,
+        mtp_sampler_params: Optional[List[Optional[dict]]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1416,6 +1453,7 @@ class PromptProcessingBatch:
             if max_tokens is not None
             else [DEFAULT_MAX_TOKENS] * len(self.uids)
         )
+        self.mtp_sampler_params = mtp_sampler_params or [None] * len(uids)
 
     def __len__(self):
         return len(self.uids)
@@ -1442,6 +1480,9 @@ class PromptProcessingBatch:
         self.logits_processors.extend(logits_processors)
         self.max_tokens.extend(batch.max_tokens)
         self.state_machines.extend(batch.state_machines)
+        self.mtp_sampler_params.extend(
+            batch.mtp_sampler_params or [None] * len(batch.uids)
+        )
 
     def _copy(self):
         new_batch = self.__class__.__new__(self.__class__)
@@ -1455,6 +1496,7 @@ class PromptProcessingBatch:
         new_batch.logits_processors = list(self.logits_processors)
         new_batch.state_machines = list(self.state_machines)
         new_batch.max_tokens = list(self.max_tokens)
+        new_batch.mtp_sampler_params = list(self.mtp_sampler_params)
         return new_batch
 
     def split(self, indices: List[int]):
@@ -1484,6 +1526,7 @@ class PromptProcessingBatch:
             self.logits_processors = [[]] * len(keep)
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.state_machines = [self.state_machines[idx] for idx in keep]
+        self.mtp_sampler_params = [self.mtp_sampler_params[idx] for idx in keep]
 
     def prompt(self, tokens: List[List[int]]):
         """
@@ -1533,12 +1576,13 @@ class PromptProcessingBatch:
             mx.eval([c.state for c in self.prompt_cache])
             mx.clear_cache()
 
-    def generate(self, tokens: List[List[int]]):
+    def generate(self, tokens: List[List[int]], mtp: bool = False):
         """
         Transition from prompt processing to generation.
 
         Args:
             tokens: Final tokens for each sequence to start generation.
+            mtp: Enable native MTP speculative decoding.
 
         Returns:
             A GenerationBatch ready for token generation.
@@ -1558,6 +1602,8 @@ class PromptProcessingBatch:
             self.logits_processors,
             self.state_machines,
             self.max_tokens,
+            mtp=mtp,
+            mtp_sampler_params=self.mtp_sampler_params,
         )
 
         self.uids = []
@@ -1623,6 +1669,8 @@ class GenerationBatch:
         ],
         state_machines: List[SequenceStateMachine],
         max_tokens: List[int],
+        mtp: bool = False,
+        mtp_sampler_params: Optional[List[Optional[dict]]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1640,6 +1688,42 @@ class GenerationBatch:
         if self.logits_processors and len(self.logits_processors) != len(self.uids):
             raise ValueError("Insufficient number of logits_processors provided")
 
+        self._mtp = mtp and hasattr(model, "mtp_forward")
+        self._mtp_cache = model.make_mtp_cache() if self._mtp else []
+
+        # Per-sequence (filter_chain, xtc_cell, temp) for MTP accept_lp computation.
+        self._mtp_filter_info: Optional[List] = None
+        if self._mtp and mtp_sampler_params:
+            self._mtp_filter_info = []
+            for p in mtp_sampler_params:
+                if p is None:
+                    self._mtp_filter_info.append(([], None, 0.0))
+                else:
+                    chain, xtc_cell = make_sampler_chain(
+                        p.get("top_p", 0.0),
+                        p.get("top_k", 0),
+                        p.get("min_p", 0.0),
+                        p.get("min_tokens_to_keep", 1),
+                        p.get("xtc_probability", 0.0),
+                        p.get("xtc_threshold", 0.0),
+                        p.get("xtc_special_tokens", []),
+                    )
+                    self._mtp_filter_info.append((chain, xtc_cell, p.get("temp", 0.0)))
+
+        if self._mtp:
+            if self._mtp_filter_info is not None:
+                self._mtp_is_greedy = all(t == 0.0 for _, _, t in self._mtp_filter_info)
+            else:
+                # No filter info: fall back to sampler-based detection.
+                self._mtp_is_greedy = not samplers or all(s is None for s in samplers)
+        else:
+            self._mtp_is_greedy = True
+
+        self._draft_toks: Optional[mx.array] = None
+        self._draft_lps: Optional[mx.array] = None
+        self._draft_accept_lps: Optional[mx.array] = None
+        self._draft_xtc_draws: Optional[List] = None
+
         self._current_tokens = None
         self._current_logprobs = []
         self._next_tokens = inputs
@@ -1648,7 +1732,7 @@ class GenerationBatch:
         self._num_tokens = [0] * len(self.uids)
         self._matcher_states = [m.make_state() for m in state_machines]
 
-        if self.uids:
+        if self.uids and not self._mtp:
             self._step()
 
     def __len__(self):
@@ -1681,6 +1765,302 @@ class GenerationBatch:
         self._num_tokens.extend(batch._num_tokens)
         self._matcher_states.extend(batch._matcher_states)
 
+        if self._mtp:
+            # Reset speculative state: the draft token is never in the backbone
+            # cache between step A and step B, so resetting is safe.
+            self._draft_toks = None
+            self._draft_lps = None
+            self._draft_accept_lps = None
+            self._draft_xtc_draws = None
+            if self._mtp_filter_info is not None:
+                self._mtp_filter_info.extend(
+                    batch._mtp_filter_info or [([], None, 0.0)] * len(batch.uids)
+                )
+            # Extend MTP cache: zero-pad new sequences to match existing offset.
+            new_b = len(batch.uids)
+            if new_b > 0:
+                for c in self._mtp_cache:
+                    if c.keys is not None:
+                        pad_k = mx.zeros((new_b,) + c.keys.shape[1:], c.keys.dtype)
+                        pad_v = mx.zeros((new_b,) + c.values.shape[1:], c.values.dtype)
+                        c.keys = mx.concatenate([c.keys, pad_k], axis=0)
+                        c.values = mx.concatenate([c.values, pad_v], axis=0)
+
+    def _sample_per_seq(self, logprobs: mx.array) -> mx.array:
+        """Sample one token per sequence using per-sequence samplers. Returns (B,)."""
+        if any(self.samplers):
+            samples = []
+            for e in range(len(self.uids)):
+                s = (self.samplers[e] or self.fallback_sampler)(logprobs[e : e + 1])
+                samples.append(s)
+            return mx.concatenate(samples, axis=0)
+        return self.fallback_sampler(logprobs)
+
+    def _apply_logits_processors(
+        self, logits: mx.array, inputs: mx.array
+    ) -> Tuple[mx.array, List]:
+        """Apply per-sequence logits processors. inputs is (B, S).
+
+        Returns (logits, token_ctx). token_ctx is empty when no processors are active.
+        """
+        if not any(self.logits_processors):
+            return logits, []
+        token_ctx = [
+            tc.update_and_fetch(inputs[i : i + 1].flatten())
+            for i, tc in enumerate(self._token_context)
+        ]
+        processed = []
+        for e in range(len(self.uids)):
+            sl = logits[e : e + 1]
+            for proc in self.logits_processors[e]:
+                sl = proc(token_ctx[e], sl)
+            processed.append(sl)
+        return mx.concatenate(processed, axis=0), token_ctx
+
+    def _mtp_process_and_sample(
+        self,
+        logits: mx.array,
+        xtc_draws: Optional[List] = None,
+    ) -> Tuple[mx.array, mx.array, mx.array]:
+        """Sample from (B, vocab) logits using per-sequence filter+temp params.
+
+        Returns (tokens_B, raw_logprobs_BxV, accept_lps_BxV).
+        raw_logprobs: unscaled log-probs, for client reporting.
+        accept_lps: temperature+filter-adjusted, for acceptance criterion.
+        """
+        B = logits.shape[0]
+
+        if self._mtp_filter_info is None:
+            # No filter info: use opaque per-sequence samplers; lp_accept = raw logprobs.
+            raw_lps = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            tokens = self._sample_per_seq(raw_lps)
+            return tokens, raw_lps, raw_lps
+
+        tokens, raw_lps_list, accept_lps_list = [], [], []
+        for i in range(B):
+            lg = logits[i]
+            lp = lg - mx.logsumexp(lg, axis=-1, keepdims=True)
+            chain, xtc_cell, temp = (
+                self._mtp_filter_info[i]
+                if i < len(self._mtp_filter_info)
+                else ([], None, 0.0)
+            )
+            draw = xtc_draws[i] if xtc_draws else None
+            tok, accept_lp = _apply_filter_and_sample(lp, chain, xtc_cell, temp, draw)
+            tokens.append(tok.reshape(1))
+            raw_lps_list.append(lp.reshape(1, -1))
+            accept_lps_list.append(accept_lp.reshape(1, -1))
+
+        return (
+            mx.concatenate(tokens, axis=0),
+            mx.concatenate(raw_lps_list, axis=0),
+            mx.concatenate(accept_lps_list, axis=0),
+        )
+
+    def _step_mtp_a(self) -> List[List[tuple]]:
+        """Step A: no pending draft. Feed _next_tokens through backbone, emit
+        backbone predictions, run MTP to generate first draft.
+
+        Returns per-seq list of one (token_id, logprob_array) tuple.
+        """
+        self._current_tokens = self._next_tokens  # (B,)
+        inputs = self._current_tokens[:, None]  # (B, 1)
+
+        with mx.stream(generation_stream):
+            logits, hidden = self.model(
+                inputs, cache=self.prompt_cache, return_hidden=True, n_confirmed=0
+            )
+        logits = logits[:, -1, :]  # (B, vocab)
+        logits, _ = self._apply_logits_processors(logits, inputs)
+        main_toks, logprobs, _ = self._mtp_process_and_sample(logits)
+
+        # MTP: predict draft token for position after main_tok.
+        hidden_last = hidden[:, -1:, :]  # (B, 1, H)
+        with mx.stream(generation_stream):
+            draft_logits = self.model.mtp_forward(
+                hidden_last, main_toks[:, None], self._mtp_cache
+            )
+        draft_logits = draft_logits[:, 0, :]  # (B, vocab)
+        draft_logits, _ = self._apply_logits_processors(
+            draft_logits, main_toks[:, None]
+        )
+        # Draw XTC booleans once here; verify step reuses them for consistency.
+        xtc_draws = (
+            [
+                mx.random.uniform() if info[1] is not None else None
+                for info in self._mtp_filter_info
+            ]
+            if self._mtp_filter_info is not None
+            else None
+        )
+        draft_toks, draft_lps, draft_accept_lps = self._mtp_process_and_sample(
+            draft_logits, xtc_draws=xtc_draws
+        )
+
+        mx.eval(main_toks, draft_toks)
+
+        # Append backbone-processed token to history.
+        for i, tok in enumerate(self._current_tokens.tolist()):
+            self.tokens[i].append(tok)
+
+        self._draft_toks = draft_toks
+        self._draft_lps = draft_lps
+        self._draft_accept_lps = draft_accept_lps
+        self._draft_xtc_draws = xtc_draws
+        self._next_tokens = main_toks
+        self._next_logprobs = list(logprobs)
+
+        main_list = main_toks.tolist()
+        lp_list = list(logprobs)
+        return [[(main_list[i], lp_list[i])] for i in range(len(self.uids))]
+
+    def _step_mtp_b(self) -> List[List[tuple]]:
+        """Step B: verify pending draft. Feed [main_tok, draft_tok] through backbone,
+        accept or reject per-sequence, run MTP on confirmed token for next draft.
+
+        Returns per-seq list of 1 (rejected) or 2 (accepted) (token_id, lp) tuples.
+        """
+        B = len(self.uids)
+        old_draft_toks = self._draft_toks  # (B,)
+        old_draft_lps = self._draft_lps  # (B, vocab)
+        old_draft_accept_lps = self._draft_accept_lps  # (B, vocab)
+        old_xtc_draws = self._draft_xtc_draws  # List[Optional[mx.array]] | None
+
+        self._current_tokens = self._next_tokens  # (B,) = main_toks from step A
+        y_with_draft = mx.concatenate(
+            [self._current_tokens[:, None], old_draft_toks[:, None]], axis=1
+        )  # (B, 2)
+
+        with mx.stream(generation_stream):
+            logits, hidden = self.model(
+                y_with_draft,
+                cache=self.prompt_cache,
+                return_hidden=True,
+                n_confirmed=1,
+            )
+        verify_logits = logits[:, 0, :]  # (B, vocab): backbone pred at draft position
+        bonus_logits = logits[:, 1, :]  # (B, vocab): backbone pred at bonus position
+
+        # Apply logits processors at verify position (context: main_tok only).
+        verify_logits, _ = self._apply_logits_processors(
+            verify_logits, y_with_draft[:, :1]
+        )
+        # Save context size per sequence so we can roll back the draft token on rejection.
+        pre_draft_ctx_sizes = [tc._size for tc in self._token_context]
+        # Apply logits processors at bonus position (context: main_tok + draft_tok).
+        bonus_logits, _ = self._apply_logits_processors(
+            bonus_logits, y_with_draft[:, 1:]
+        )
+
+        # Verify: compute accept_lps from the same distribution the token was drawn from.
+        # Reuse the XTC draw from step A so draft/verify share the same apply/skip decision.
+        _, verify_lps, verify_accept_lps = self._mtp_process_and_sample(
+            verify_logits, xtc_draws=old_xtc_draws
+        )
+
+        # Per-sequence acceptance via log-probability criterion.
+        # Works for both greedy (exact-match shortcut) and stochastic (Metropolis-Hastings).
+        arange_b = mx.arange(B)
+        log_accepts = (
+            verify_accept_lps[arange_b, old_draft_toks]
+            - old_draft_accept_lps[arange_b, old_draft_toks]
+        )
+        mx.eval(log_accepts, old_draft_toks)
+        draft_list = old_draft_toks.tolist()
+        accept_list = _mtp_accept(
+            log_accepts,
+            self._mtp_is_greedy,
+            mx.argmax(verify_lps, axis=-1),
+            old_draft_toks,
+        )
+        accept_mask = mx.array(accept_list)  # (B,) bool
+
+        # Selective rollback: restore SSM/KV state for rejected sequences.
+        for c in self.prompt_cache:
+            if hasattr(c, "rollback_selective"):
+                c.rollback_selective(accept_mask)
+            elif hasattr(c, "trim_selective"):
+                c.trim_selective(accept_mask)
+
+        # Rollback token context for rejected sequences (draft_tok not confirmed).
+        for i in range(B):
+            if not accept_list[i]:
+                self._token_context[i]._size = pre_draft_ctx_sizes[i]
+
+        bonus_toks, bonus_lps, _ = self._mtp_process_and_sample(bonus_logits)
+        if self._mtp_is_greedy:
+            corrected_toks = mx.argmax(verify_lps, axis=-1)
+        else:
+            corrected_toks = _mtp_residual_sample(
+                verify_accept_lps, old_draft_accept_lps
+            )
+        mx.eval(bonus_toks, corrected_toks)
+        bonus_list = bonus_toks.tolist()
+        corrected_list = corrected_toks.tolist()
+
+        # Select per-sequence inputs to MTP: accepted uses draft-position hidden
+        # and bonus_tok; rejected uses confirmed-position hidden and corrected_tok.
+        hidden_for_mtp = mx.where(
+            accept_mask[:, None, None],
+            hidden[:, 1:2, :],  # draft position hidden
+            hidden[:, 0:1, :],  # confirmed position hidden
+        )  # (B, 1, H)
+        toks_for_mtp = mx.where(
+            accept_mask[:, None],
+            bonus_toks[:, None],
+            corrected_toks[:, None],
+        )  # (B, 1)
+        with mx.stream(generation_stream):
+            new_draft_logits = self.model.mtp_forward(
+                hidden_for_mtp, toks_for_mtp, self._mtp_cache
+            )
+        new_draft_logits = new_draft_logits[:, 0, :]  # (B, vocab)
+        new_draft_logits, _ = self._apply_logits_processors(
+            new_draft_logits, toks_for_mtp
+        )
+        new_xtc_draws = (
+            [
+                mx.random.uniform() if info[1] is not None else None
+                for info in self._mtp_filter_info
+            ]
+            if self._mtp_filter_info is not None
+            else None
+        )
+        new_draft_toks, new_draft_lps, new_draft_accept_lps = (
+            self._mtp_process_and_sample(new_draft_logits, xtc_draws=new_xtc_draws)
+        )
+        mx.eval(new_draft_toks)
+
+        self._draft_toks = new_draft_toks
+        self._draft_lps = new_draft_lps
+        self._draft_accept_lps = new_draft_accept_lps
+        self._draft_xtc_draws = new_xtc_draws
+
+        # _next_tokens: accepted → bonus, rejected → corrected.
+        next_list = [
+            bonus_list[i] if accept_list[i] else corrected_list[i] for i in range(B)
+        ]
+        self._next_tokens = mx.array(next_list, mx.uint32)
+
+        # Update token history: main_tok always (processed by backbone),
+        # draft_tok only if accepted (backbone confirmed it).
+        main_list = self._current_tokens.tolist()
+        for i in range(B):
+            self.tokens[i].append(main_list[i])
+            if accept_list[i]:
+                self.tokens[i].append(draft_list[i])
+
+        # Build per-sequence emission lists.
+        result = []
+        for i in range(B):
+            if accept_list[i]:
+                result.append(
+                    [(draft_list[i], old_draft_lps[i]), (bonus_list[i], bonus_lps[i])]
+                )
+            else:
+                result.append([(corrected_list[i], verify_lps[i])])
+        return result
+
     def _step(self) -> Tuple[List[int], List[mx.array]]:
         """
         Perform a single generation step.
@@ -1696,35 +2076,12 @@ class GenerationBatch:
         logits = self.model(inputs[:, None], cache=self.prompt_cache)
         logits = logits[:, -1, :]
 
-        # Logits processors
-        token_context = []
-        if any(self.logits_processors):
-            # Update the token context that will be used by the logits processors
-            token_context = [
-                tc.update_and_fetch(inputs[i : i + 1])
-                for i, tc in enumerate(self._token_context)
-            ]
-            processed_logits = []
-            for e in range(len(self.uids)):
-                sample_logits = logits[e : e + 1]
-                for processor in self.logits_processors[e]:
-                    sample_logits = processor(token_context[e], sample_logits)
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
+        logits, token_context = self._apply_logits_processors(logits, inputs[:, None])
 
         # Normalize the logits
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
-        # Sample
-        if any(self.samplers):
-            all_samples = []
-            for e in range(len(self.uids)):
-                sample_sampler = self.samplers[e] or self.fallback_sampler
-                sampled = sample_sampler(logprobs[e : e + 1])
-                all_samples.append(sampled)
-            sampled = mx.concatenate(all_samples, axis=0)
-        else:
-            sampled = self.fallback_sampler(logprobs)
+        sampled = self._sample_per_seq(logprobs)
 
         # Assign the next step to member variables and start computing it
         # asynchronously
@@ -1766,6 +2123,18 @@ class GenerationBatch:
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
         self._matcher_states = [self._matcher_states[idx] for idx in keep]
 
+        if self._mtp:
+            for c in self._mtp_cache:
+                if hasattr(c, "filter"):
+                    c.filter(keep)
+            if self._draft_toks is not None:
+                self._draft_toks = self._draft_toks[keep]
+                self._draft_lps = self._draft_lps[keep]
+                self._draft_accept_lps = self._draft_accept_lps[keep]
+                self._draft_xtc_draws = [self._draft_xtc_draws[i] for i in keep]
+            if self._mtp_filter_info is not None:
+                self._mtp_filter_info = [self._mtp_filter_info[i] for i in keep]
+
     def next(self) -> List[Response]:
         """
         Generate the next batch of tokens.
@@ -1776,51 +2145,62 @@ class GenerationBatch:
         if not self.uids:
             return []
 
-        tokens, logprobs = self._step()
+        if self._mtp:
+            per_seq = (
+                self._step_mtp_a() if self._draft_toks is None else self._step_mtp_b()
+            )
+        else:
+            tokens, logprobs = self._step()
+            per_seq = [[(tok, lp)] for tok, lp in zip(tokens, logprobs)]
 
         keep = []
         responses = []
         for i in range(len(self.uids)):
-            finish_reason = None
-            match_sequence = None
+            seq_done = False
+            for tok_id, lp in per_seq[i]:
+                if seq_done:
+                    break
+                finish_reason = None
+                self._num_tokens[i] += 1
+                if self._num_tokens[i] >= self.max_tokens[i]:
+                    finish_reason = "length"
 
-            self._num_tokens[i] += 1
-            if self._num_tokens[i] >= self.max_tokens[i]:
-                finish_reason = "length"
+                self._matcher_states[i], match_seq, current_state = self.state_machines[
+                    i
+                ].match(self._matcher_states[i], tok_id)
+                if match_seq is not None and current_state is None:
+                    finish_reason = "stop"
 
-            self._matcher_states[i], match_sequence, current_state = (
-                self.state_machines[i].match(self._matcher_states[i], tokens[i])
-            )
-            if match_sequence is not None and current_state is None:
-                finish_reason = "stop"
-
-            if finish_reason is not None:
-                responses.append(
-                    self.Response(
-                        uid=self.uids[i],
-                        token=tokens[i],
-                        logprobs=logprobs[i],
-                        finish_reason=finish_reason,
-                        current_state=current_state,
-                        match_sequence=match_sequence,
-                        prompt_cache=self.extract_cache(i),
-                        all_tokens=self.tokens[i],
+                if finish_reason is not None:
+                    responses.append(
+                        self.Response(
+                            uid=self.uids[i],
+                            token=tok_id,
+                            logprobs=lp,
+                            finish_reason=finish_reason,
+                            current_state=current_state,
+                            match_sequence=match_seq,
+                            prompt_cache=self.extract_cache(i),
+                            all_tokens=self.tokens[i],
+                        )
                     )
-                )
-            else:
+                    seq_done = True
+                else:
+                    responses.append(
+                        self.Response(
+                            uid=self.uids[i],
+                            token=tok_id,
+                            logprobs=lp,
+                            finish_reason=None,
+                            current_state=current_state,
+                            match_sequence=match_seq,
+                            prompt_cache=None,
+                            all_tokens=None,
+                        )
+                    )
+
+            if not seq_done:
                 keep.append(i)
-                responses.append(
-                    self.Response(
-                        uid=self.uids[i],
-                        token=tokens[i],
-                        logprobs=logprobs[i],
-                        finish_reason=None,
-                        match_sequence=match_sequence,
-                        current_state=current_state,
-                        prompt_cache=None,
-                        all_tokens=None,
-                    )
-                )
 
         if len(keep) < len(self.uids):
             self.filter(keep)
@@ -1832,6 +2212,7 @@ class GenerationBatch:
         cls,
         model: nn.Module,
         fallback_sampler: Callable[[mx.array], mx.array],
+        mtp: bool = False,
     ):
         return cls(
             model=model,
@@ -1844,6 +2225,7 @@ class GenerationBatch:
             logits_processors=[],
             max_tokens=[],
             state_machines=[],
+            mtp=mtp,
         )
 
 
@@ -1873,6 +2255,7 @@ class BatchGenerator:
         prefill_step_size: int = 2048,
         max_kv_size: Optional[int] = None,
         stream=None,
+        mtp: bool = False,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1883,6 +2266,7 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
+        self.mtp = mtp and hasattr(model, "mtp_forward")
 
         self._stream = stream or generation_stream
 
@@ -1896,7 +2280,9 @@ class BatchGenerator:
             self.sampler,
             prefill_step_size=prefill_step_size,
         )
-        self._generation_batch = GenerationBatch.empty(self.model, self.sampler)
+        self._generation_batch = GenerationBatch.empty(
+            self.model, self.sampler, mtp=self.mtp
+        )
         self._unprocessed_sequences = deque()
         self._currently_processing = []
 
@@ -1979,6 +2365,7 @@ class BatchGenerator:
             List[List[Callable[[mx.array, mx.array], mx.array]]]
         ] = None,
         state_machines: Optional[List[SequenceStateMachine]] = None,
+        mtp_sampler_params: Optional[List[Optional[dict]]] = None,
     ):
         uids = []
 
@@ -1991,13 +2378,14 @@ class BatchGenerator:
         state_machines = state_machines or (
             [self._default_state_machine] * len(segments)
         )
+        mtp_sampler_params = mtp_sampler_params or [None] * len(segments)
 
         caches = caches or [None] * len(segments)
         for i in range(len(segments)):
             if caches[i] is None:
                 caches[i] = self._make_new_cache()
 
-        for seq, m, c, at, s, lp, sm in zip(
+        for seq, m, c, at, s, lp, sm, mp in zip(
             segments,
             max_tokens,
             caches,
@@ -2005,13 +2393,14 @@ class BatchGenerator:
             samplers,
             logits_processors,
             state_machines,
+            mtp_sampler_params,
         ):
             seq = list(seq)
             if len(seq[-1]) != 1:
                 seq.append(seq[-1][-1:])
                 seq[-2] = seq[-2][:-1]
             self._unprocessed_sequences.append(
-                (self._uid_count, seq, m, c, at, s, lp, sm)
+                (self._uid_count, seq, m, c, at, s, lp, sm, mp)
             )
             uids.append(self._uid_count)
             self._uid_count += 1
@@ -2104,6 +2493,7 @@ class BatchGenerator:
         logits_processors = []
         max_tokens = []
         state_machines = []
+        mtp_sampler_params = []
         for _ in range(n):
             sequence = self._unprocessed_sequences.popleft()
             uids.append(sequence[0])
@@ -2113,6 +2503,7 @@ class BatchGenerator:
             logits_processors.append(sequence[6])
             max_tokens.append(sequence[2])
             state_machines.append(sequence[7])
+            mtp_sampler_params.append(sequence[8] if len(sequence) > 8 else None)
             self._currently_processing.append(
                 [sequence[1], 0, sum(len(s) for s in sequence[1])]
             )
@@ -2128,6 +2519,7 @@ class BatchGenerator:
             logits_processors=logits_processors,
             state_machines=state_machines,
             max_tokens=max_tokens,
+            mtp_sampler_params=mtp_sampler_params,
         )
 
     def _next(self):
@@ -2170,7 +2562,9 @@ class BatchGenerator:
             last_inputs = [self._currently_processing[i][0][0] for i in split]
             progress = [(self._currently_processing[i][2],) * 2 for i in split]
             self._currently_processing = [self._currently_processing[i] for i in keep]
-            gen_batch = self._prompt_batch.split(split).generate(last_inputs)
+            gen_batch = self._prompt_batch.split(split).generate(
+                last_inputs, mtp=self.mtp
+            )
             for i, p in enumerate(progress):
                 prompt_responses.append(
                     PromptProcessingBatch.Response(

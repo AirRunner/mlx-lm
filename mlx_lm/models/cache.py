@@ -380,6 +380,11 @@ class KVCache(_BaseCache):
         self.offset -= n
         return n
 
+    def filter(self, batch_indices):
+        if self.keys is not None:
+            self.keys = self.keys[batch_indices]
+            self.values = self.values[batch_indices]
+
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
         quant_cache.offset = self.offset
@@ -692,6 +697,24 @@ class ArraysCache(_BaseCache):
         if self.left_padding is not None:
             self.left_padding -= N
 
+    def rollback_selective(self, accept_mask: "mx.array"):
+        """Restore SSM/conv state for rejected sequences only (MTP batch rollback).
+
+        accept_mask: bool array of shape (B,), True = sequence accepted its draft.
+        """
+        if self.rollback_state is None:
+            return
+        conv_snap, ssm_snap = self.rollback_state
+        acc = accept_mask
+        while acc.ndim < self.cache[0].ndim:
+            acc = acc[..., None]
+        self.cache[0] = mx.where(acc, self.cache[0], conv_snap)
+        acc = accept_mask
+        while acc.ndim < self.cache[1].ndim:
+            acc = acc[..., None]
+        self.cache[1] = mx.where(acc, self.cache[1], ssm_snap)
+        self.rollback_state = None
+
     def make_mask(self, N: int):
         if self.left_padding is not None:
             pos = mx.arange(N)
@@ -942,6 +965,9 @@ class BatchKVCache(_BaseCache):
         self._idx = 0
 
         self._right_padding = None
+        # Per-sequence bitmask of live KV positions; None = all live.
+        # Set by trim_selective when MTP rejects a draft token.
+        self._kv_alive = None  # (B, buf_capacity) bool
 
     def update_and_fetch(self, keys, values):
         prev = self._idx
@@ -954,11 +980,18 @@ class BatchKVCache(_BaseCache):
             new_k = mx.zeros(k_shape, keys.dtype)
             new_v = mx.zeros(v_shape, values.dtype)
             if self.keys is not None:
+                old_buf = self.keys.shape[2]
                 if prev % self.step != 0:
                     self.keys = self.keys[..., :prev, :]
                     self.values = self.values[..., :prev, :]
+                    old_buf = prev
                 self.keys = mx.concatenate([self.keys, new_k], axis=2)
                 self.values = mx.concatenate([self.values, new_v], axis=2)
+                if self._kv_alive is not None:
+                    pad = mx.ones((B, self.keys.shape[2] - old_buf), dtype=mx.bool_)
+                    self._kv_alive = mx.concatenate(
+                        [self._kv_alive[:, :old_buf], pad], axis=1
+                    )
             else:
                 self.keys, self.values = new_k, new_v
 
@@ -1012,10 +1045,40 @@ class BatchKVCache(_BaseCache):
         self.offset -= n
         return n
 
+    def trim_selective(self, accept_mask: "mx.array"):
+        """Decrement offset by 1 only for rejected sequences (MTP batch rollback).
+
+        accept_mask: bool array of shape (B,), True = sequence accepted its draft.
+        The _idx stays the same; the draft slot is marked dead in _kv_alive so
+        make_mask hides it from future attention without touching _idx.
+        """
+        self.offset = mx.where(accept_mask, self.offset, self.offset - 1)
+        if self.keys is None:
+            return
+        dead_pos = self._idx - 1
+        B = self.keys.shape[0]
+        buf = self.keys.shape[2]
+        if self._kv_alive is None:
+            self._kv_alive = mx.ones((B, buf), dtype=mx.bool_)
+        pos_mask = mx.arange(self._kv_alive.shape[1]) == dead_pos  # (buf,)
+        reject_mask = ~accept_mask  # (B,)
+        self._kv_alive = mx.where(
+            reject_mask[:, None] & pos_mask[None, :],
+            False,
+            self._kv_alive,
+        )
+
     def make_mask(self, N: int, return_array: bool = False, **kwargs):
-        return create_causal_mask(
+        mask = create_causal_mask(
             N, offset=self._idx, left_padding=self.left_padding, **kwargs
         )
+        if self._kv_alive is not None:
+            # Slice to the positions visible in this step's attention.
+            # _kv_alive may be shorter than _idx+N if buffer hasn't grown yet;
+            # positions beyond its length are implicitly alive (not yet written).
+            alive = self._kv_alive[:, : self._idx + N]  # (B, _idx+N) or shorter
+            mask = mask & alive[:, None, None, :]
+        return mask
 
     def filter(self, batch_indices):
         """
@@ -1026,6 +1089,8 @@ class BatchKVCache(_BaseCache):
             self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        if self._kv_alive is not None:
+            self._kv_alive = self._kv_alive[batch_indices]
 
         # Shift left to reduce padding
         min_left_pad = self.left_padding.min().item()
@@ -1033,6 +1098,8 @@ class BatchKVCache(_BaseCache):
             if self.keys is not None:
                 self.keys = self.keys[..., min_left_pad:, :]
                 self.values = self.values[..., min_left_pad:, :]
+            if self._kv_alive is not None:
+                self._kv_alive = self._kv_alive[:, min_left_pad:]
             self._idx -= min_left_pad
             self.left_padding -= min_left_pad
 
