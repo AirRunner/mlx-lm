@@ -822,14 +822,10 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    # Prefer single-sequence MTP when the queue is empty;
-                    # fall back to BatchGenerator when requests are queued.
                     mtp_active = getattr(self.cli_args, "mtp", False) and hasattr(
                         model, "mtp_forward"
                     )
-                    if not self._is_batchable(args) or (
-                        mtp_active and self.requests.empty()
-                    ):
+                    if not self._is_batchable(args):
                         self._serve_single((rqueue, request, args))
                         continue
 
