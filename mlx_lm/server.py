@@ -792,12 +792,10 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    # Native MTP is currently single-sequence only. Keep routing
-                    # deterministic instead of racing a best-effort queue check.
                     mtp_active = getattr(self.cli_args, "mtp", False) and (
                         _model_supports_mtp(model)
                     )
-                    if not self._is_batchable(args) or mtp_active:
+                    if not self._is_batchable(args):
                         self._serve_single((rqueue, request, args), generation_stream)
                         continue
 
