@@ -329,12 +329,9 @@ class TestMTP(unittest.TestCase):
         prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
         n_tokens = 12
 
-        def stochastic(logprobs):
-            return mx.random.categorical(logprobs)
-
         tokens = []
         for tok, _, _ in mtp_generate_step(
-            prompt, self.model, sampler=stochastic, max_tokens=n_tokens, mtp_depth=2
+            prompt, self.model, temp=1.0, max_tokens=n_tokens, mtp_depth=2
         ):
             tokens.append(int(tok))
             if len(tokens) >= n_tokens:
