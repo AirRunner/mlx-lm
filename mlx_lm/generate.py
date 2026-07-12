@@ -674,6 +674,7 @@ def mtp_generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     input_embeddings: Optional[mx.array] = None,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     temp: float = 0.0,
     top_p: float = 0.0,
     top_k: int = 0,
@@ -699,6 +700,8 @@ def mtp_generate_step(
     """
     y = prompt.astype(mx.uint32)
     prev_tokens = None
+    prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+    total_prompt_tokens = y.size
 
     if prompt_cache is None:
         model_cache = cache.make_prompt_cache(model)
@@ -848,6 +851,7 @@ def mtp_generate_step(
     def _prefill(y, input_embeddings):
         # Leave exactly 1 token for _step_backbone so the decode loop starts clean.
         total = len(input_embeddings) if input_embeddings is not None else y.size
+        processed = total_prompt_tokens - total
         while total > 1:
             n = min(prefill_step_size, total - 1)
             if input_embeddings is not None:
@@ -866,6 +870,8 @@ def mtp_generate_step(
             mx.eval([c.state for c in model_cache + mtp_cache if hasattr(c, "state")])
             y = y[n:]
             total -= n
+            processed += n
+            prompt_progress_callback(processed, total_prompt_tokens)
             mx.clear_cache()
         return y
 
@@ -1046,12 +1052,13 @@ def stream_generate(
         )
     elif mtp and hasattr(model, "mtp_forward"):
         kwargs.pop("max_kv_size", None)
-        kwargs.pop("prompt_progress_callback", None)
+        prompt_progress_callback = kwargs.pop("prompt_progress_callback", None)
         kwargs.pop("num_draft_tokens", None)
         kwargs.pop("sampler", None)  # mtp_generate_step does not accept sampler=
         token_generator = mtp_generate_step(
             prompt,
             model,
+            prompt_progress_callback=prompt_progress_callback,
             temp=temp,
             top_p=top_p,
             top_k=top_k,
