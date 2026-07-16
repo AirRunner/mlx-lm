@@ -550,7 +550,7 @@ class TestMTPBatch(unittest.TestCase):
 
         sampler: per-sequence sampler callable, or None for greedy (argmax).
         """
-        from mlx_lm.generate import SequenceStateMachine
+        from mlx_lm.generate import StopSequenceMatcher
         from mlx_lm.models.cache import make_prompt_cache
 
         B = len(prompts)
@@ -575,7 +575,7 @@ class TestMTPBatch(unittest.TestCase):
         )
         samplers = [sampler] * B  # None → greedy path (_mtp_is_greedy=True)
         last_tokens = mx.array([p[-1] for p in prompts], dtype=mx.uint32)
-        sm = SequenceStateMachine({}, initial="normal")
+        stop_matcher = StopSequenceMatcher()
         return GenerationBatch(
             model=self.model,
             uids=list(range(B)),
@@ -585,7 +585,7 @@ class TestMTPBatch(unittest.TestCase):
             samplers=samplers,
             fallback_sampler=fallback,
             logits_processors=[[]] * B,
-            state_machines=[sm] * B,
+            stop_matchers=[stop_matcher] * B,
             max_tokens=[64] * B,
             mtp=mtp,
         )
