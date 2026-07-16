@@ -381,7 +381,7 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(m, 5)
 
         c = CacheList(ArraysCache(size=2), KVCache())
-        self.assertFalse(c.is_trimmable())
+        self.assertTrue(c.is_trimmable())
 
         c1 = CacheList(ArraysCache(size=1), KVCache())
         c1[0][0] = mx.random.normal(shape=(1, 2, 4, 4))
