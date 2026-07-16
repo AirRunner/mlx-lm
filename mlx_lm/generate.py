@@ -829,7 +829,9 @@ def mtp_generate_step(
                 prev_tokens,
             )
 
-    def _step_mtp(hidden_last, main_tok, prev_tokens, *, cache_commit=None, return_hidden=False):
+    def _step_mtp(
+        hidden_last, main_tok, prev_tokens, *, cache_commit=None, return_hidden=False
+    ):
         """Run the MTP head and return (draft_token, draft_logprobs, draft_accept_lp, xtc_draw[, hidden]).
 
         cache_commit: (hidden, tok) prepended so the last accepted draft token is
@@ -889,7 +891,9 @@ def mtp_generate_step(
         for d in range(mtp_depth):
             commit = cache_commit if d == 0 else None
             if d < mtp_depth - 1:
-                dt, dlp, dalp, xtc_draw, h = _step_mtp(h, tok, ctx, cache_commit=commit, return_hidden=True)
+                dt, dlp, dalp, xtc_draw, h = _step_mtp(
+                    h, tok, ctx, cache_commit=commit, return_hidden=True
+                )
             else:
                 dt, dlp, dalp, xtc_draw = _step_mtp(h, tok, ctx, cache_commit=commit)
             if d == 0:
@@ -1025,7 +1029,10 @@ def mtp_generate_step(
                         hidden[:, mtp_depth : mtp_depth + 1, :],
                         bonus_tok,
                         prev_tokens,
-                        cache_commit=(hidden[:, mtp_depth - 1 : mtp_depth, :], draft_toks[-1]),
+                        cache_commit=(
+                            hidden[:, mtp_depth - 1 : mtp_depth, :],
+                            draft_toks[-1],
+                        ),
                     )
                 )
                 y = mx.array([bonus_tok.item()], mx.uint32)
@@ -1146,6 +1153,7 @@ def stream_generate(
                 stacklevel=2,
             )
         kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("mtp_depth", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
